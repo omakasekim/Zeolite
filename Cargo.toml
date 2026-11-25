@@ -7,7 +7,7 @@ version = "0.2.0"
 edition = "2024"
 license = "MIT"
 authors = ["Jeong Hoon Kim <jk9576@hanyang.ac.kr>"]
-repository = "https://github.com/Aetherx86/Zeolite"
+repository = "https://github.com/omakasekim/Zeolite"
 
 [profile.release]
 lto = "thin"

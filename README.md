@@ -259,7 +259,7 @@ On a GitHub Actions runner, under nested virtualization:
 
 A bug or security fix increments `0.0.X`. New functionality or new platform support
 increments `0.X.0`. See [CHANGELOG.md](CHANGELOG.md). Each tag publishes binaries to GitHub
-Releases and a container image to `ghcr.io/aetherx86/zeolite`.
+Releases and a container image to `ghcr.io/omakasekim/zeolite`.
 
 CI runs `cargo audit`. It reports no vulnerabilities. One unmaintained crate that arrives
 through wasmtime is accepted, with its reason, in `.cargo/audit.toml`. Nine unsoundness
