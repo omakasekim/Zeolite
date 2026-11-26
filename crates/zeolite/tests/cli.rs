@@ -195,6 +195,51 @@ fn inspect_reports_a_data_directory_without_changing_it() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn wasm_reports_json_output() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let wasm = wat::parse_str(
+        r#"(module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "handle") (param $ptr i32) (param $len i32) (result i64)
+                (i64.or
+                    (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
+                    (i64.extend_i32_u (local.get $len))))
+        )"#,
+    )
+    .unwrap();
+    let file = temp_path("echo.wasm");
+    std::fs::write(&file, &wasm).unwrap();
+    let mut child = Process::new(env!("CARGO_BIN_EXE_zeolite"))
+        .args(["wasm", file.to_str().unwrap(), "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"hello-zeolite")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value = json(&out);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["output_utf8"], "hello-zeolite");
+    assert_eq!(value["output_bytes"], 13);
+    assert_eq!(value["output_sha256"].as_str().unwrap().len(), 64);
+    assert!(value["fuel_used"].as_u64().unwrap() > 0);
+    std::fs::remove_file(&file).unwrap();
+}
+
 fn postcard_bytes(command: &Command) -> Vec<u8> {
     postcard::to_allocvec(command).unwrap()
 }

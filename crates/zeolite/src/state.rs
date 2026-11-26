@@ -98,6 +98,23 @@ enum StoredWorkload {
     },
 }
 
+/// Read-only metadata snapshot for a deployed workload (never exposes secrets).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkloadSummary {
+    pub tenant: String,
+    pub name: String,
+    pub kind: &'static str,
+    pub code_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_webhook_secret: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<&'static str>,
+}
+
 /// A deployed workload, with its compiled code held alongside the stored form.
 pub enum Workload {
     Zel {
@@ -152,6 +169,66 @@ impl State {
 
     pub fn is_empty(&self) -> bool {
         self.workloads.is_empty()
+    }
+
+    /// Returns counts of deployed workloads by execution tier: `(zel, wasm, vm)`.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let (mut zel, mut wasm, mut vm) = (0, 0, 0);
+        for workload in self.workloads.values() {
+            match workload {
+                Workload::Zel { .. } => zel += 1,
+                Workload::Wasm { .. } => wasm += 1,
+                Workload::Vm { .. } => vm += 1,
+            }
+        }
+        (zel, wasm, vm)
+    }
+
+    /// Returns a read-only summary for one deployed workload without exposing secrets.
+    pub fn summary(&self, tenant: &str, name: &str) -> Option<WorkloadSummary> {
+        let workload = self.get(tenant, name)?;
+        Some(summarize_workload(tenant, name, workload))
+    }
+
+    /// Lists deployed workloads in deterministic `(tenant, name)` order, optionally filtered by tenant.
+    pub fn list(&self, tenant: Option<&str>) -> Vec<WorkloadSummary> {
+        self.workloads
+            .iter()
+            .filter(|((t, _), _)| tenant.is_none_or(|wanted| wanted == t))
+            .map(|((t, n), w)| summarize_workload(t, n, w))
+            .collect()
+    }
+
+    /// Evaluates a Zel function locally against a cloned copy of its linear memory.
+    ///
+    /// Never mutates replicated state and requires no Raft round-trip. Returns `None` if the
+    /// workload does not exist or is not a Zel workload.
+    pub fn query(
+        &self,
+        tenant: &str,
+        name: &str,
+        function: &str,
+        args: &[i64],
+        gas: u64,
+    ) -> Option<Output> {
+        let Workload::Zel { memory, module, .. } = self.get(tenant, name)? else {
+            return None;
+        };
+        let backend = if module.has_jit() {
+            Backend::Jit
+        } else {
+            Backend::Interpreter
+        };
+        let mut scratch = memory.clone();
+        let limits = JitLimits::with_gas(gas.min(MAX_EXEC_GAS));
+        let output = match module.call(backend, function, args, &mut scratch, limits) {
+            Ok(outcome) => Output::Executed {
+                result: outcome.result.map_err(|t| t.to_string()),
+                gas_used: outcome.gas_used,
+            },
+            Err(error) => Output::Rejected(error.to_string()),
+        };
+        Some(output)
     }
 
     pub fn apply(&mut self, command: Command) -> Output {
@@ -318,6 +395,56 @@ impl State {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
+    }
+}
+
+fn summarize_workload(tenant: &str, name: &str, workload: &Workload) -> WorkloadSummary {
+    match workload {
+        Workload::Zel { source, memory, .. } => WorkloadSummary {
+            tenant: tenant.to_string(),
+            name: name.to_string(),
+            kind: "zel",
+            code_bytes: source.len(),
+            memory_bytes: Some(memory.len()),
+            memory_sha256: Some(
+                Sha256::digest(memory)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            ),
+            has_webhook_secret: None,
+            arch: None,
+        },
+        Workload::Wasm {
+            wasm,
+            webhook_secret,
+        } => WorkloadSummary {
+            tenant: tenant.to_string(),
+            name: name.to_string(),
+            kind: "wasm",
+            code_bytes: wasm.len(),
+            memory_bytes: None,
+            memory_sha256: None,
+            has_webhook_secret: Some(webhook_secret.is_some()),
+            arch: None,
+        },
+        Workload::Vm { image } => {
+            let (arch, bytes) = match image {
+                VmImage::RawX86LongMode(b) => ("x86-long", b.len()),
+                VmImage::RawX86RealMode(b) => ("x86-real", b.len()),
+                VmImage::RawAarch64(b) => ("aarch64", b.len()),
+            };
+            WorkloadSummary {
+                tenant: tenant.to_string(),
+                name: name.to_string(),
+                kind: "vm",
+                code_bytes: bytes,
+                memory_bytes: None,
+                memory_sha256: None,
+                has_webhook_secret: None,
+                arch: Some(arch),
+            }
+        }
     }
 }
 
@@ -546,5 +673,42 @@ mod tests {
     #[test]
     fn corrupt_snapshots_are_refused() {
         assert!(State::decode(&[0xFF; 16]).is_err());
+    }
+
+    #[test]
+    fn query_does_not_mutate_state_and_inventory_redacts_secrets() {
+        let mut state = State::default();
+        deploy(&mut state);
+        exec(&mut state, "add", &[12]);
+        state.apply(Command::DeployWasm {
+            tenant: "acme".into(),
+            name: "hook".into(),
+            wasm: vec![0, 97, 115, 109],
+            webhook_secret: Some(b"top-secret".to_vec()),
+        });
+        state.apply(Command::DeployVm {
+            tenant: "ops".into(),
+            name: "guest".into(),
+            image: VmImage::RawX86LongMode(vec![0xF4]),
+        });
+        let digest_before = state.digest();
+        match state.query("acme", "counter", "add", &[8], 10_000) {
+            Some(Output::Executed { result, gas_used }) => {
+                assert_eq!(result, Ok(20));
+                assert!(gas_used > 0);
+            }
+            other => panic!("unexpected query output: {other:?}"),
+        }
+        assert_eq!(state.digest(), digest_before);
+        assert_eq!(state.counts(), (1, 1, 1));
+        assert_eq!(state.list(None).len(), 3);
+        assert_eq!(state.list(Some("acme")).len(), 2);
+        let wasm_summary = state.summary("acme", "hook").unwrap();
+        assert_eq!(wasm_summary.has_webhook_secret, Some(true));
+        assert!(
+            !serde_json::to_string(&wasm_summary)
+                .unwrap()
+                .contains("top-secret")
+        );
     }
 }

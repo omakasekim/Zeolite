@@ -80,6 +80,9 @@ enum Commands {
         file: PathBuf,
         #[arg(long, default_value_t = 100_000_000)]
         fuel: u64,
+        /// Prints execution metrics and output summary as JSON on stdout.
+        #[arg(long)]
+        json: bool,
     },
     /// Boots a micro-VM and prints its serial output.
     Vm {
@@ -106,6 +109,9 @@ enum Commands {
         memory_mib: usize,
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
+        /// Prints the VM outcome and serial output as JSON on stdout.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -306,7 +312,8 @@ fn run_inspect(dir: PathBuf, json: bool) -> Result<(), AnyError> {
     Ok(())
 }
 
-fn run_wasm(file: PathBuf, fuel: u64) -> Result<(), AnyError> {
+fn run_wasm(file: PathBuf, fuel: u64, json: bool) -> Result<(), AnyError> {
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     let wasm = std::fs::read(file)?;
     let mut input = Vec::new();
@@ -318,6 +325,34 @@ fn run_wasm(file: PathBuf, fuel: u64) -> Result<(), AnyError> {
         ..Limits::default()
     };
     let outcome = runtime.invoke(&function, &input, &limits);
+    if json {
+        let mut report = serde_json::json!({
+            "fuel_used": outcome.fuel_used,
+            "instantiate_micros": outcome.instantiate.as_micros() as u64,
+            "elapsed_micros": outcome.elapsed.as_micros() as u64,
+            "logs": String::from_utf8_lossy(&outcome.logs),
+        });
+        match outcome.result {
+            Ok(output) => {
+                let digest: String = Sha256::digest(&output)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                report["ok"] = true.into();
+                report["output_bytes"] = output.len().into();
+                report["output_sha256"] = digest.into();
+                if let Ok(text) = String::from_utf8(output) {
+                    report["output_utf8"] = text.into();
+                }
+            }
+            Err(err) => {
+                report["ok"] = false.into();
+                report["error"] = err.to_string().into();
+            }
+        }
+        println!("{report}");
+        return Ok(());
+    }
     eprintln!(
         "fuel used: {}, instantiate: {:?}, total: {:?}",
         outcome.fuel_used, outcome.instantiate, outcome.elapsed
@@ -339,6 +374,7 @@ fn run_vm(
     blob_aarch64: Option<PathBuf>,
     memory_mib: usize,
     timeout_secs: u64,
+    json: bool,
 ) -> Result<(), AnyError> {
     use std::io::Write;
     let payload = if let Some(path) = kernel {
@@ -360,6 +396,17 @@ fn run_vm(
     cfg.memory_bytes = memory_mib << 20;
     cfg.timeout = Duration::from_secs(timeout_secs);
     let outcome = zeolite_vmm::run(cfg)?;
+    if json {
+        let report = serde_json::json!({
+            "exit": format!("{:?}", outcome.exit),
+            "elapsed_micros": outcome.elapsed.as_micros() as u64,
+            "exits": outcome.exits,
+            "serial_bytes": outcome.serial.len(),
+            "serial": String::from_utf8_lossy(&outcome.serial),
+        });
+        println!("{report}");
+        return Ok(());
+    }
     std::io::stdout().write_all(&outcome.serial)?;
     eprintln!(
         "exit: {:?}, elapsed: {:?}, VM exits: {}",
@@ -400,7 +447,7 @@ fn main() -> Result<(), AnyError> {
             json,
         } => run_zel(file, call, args, gas, memory, interpret, compare, json),
         Commands::Inspect { dir, json } => run_inspect(dir, json),
-        Commands::Wasm { file, fuel } => run_wasm(file, fuel),
+        Commands::Wasm { file, fuel, json } => run_wasm(file, fuel, json),
         Commands::Vm {
             kernel,
             cmdline,
@@ -410,6 +457,7 @@ fn main() -> Result<(), AnyError> {
             blob_aarch64,
             memory_mib,
             timeout_secs,
+            json,
         } => run_vm(
             kernel,
             cmdline,
@@ -419,6 +467,7 @@ fn main() -> Result<(), AnyError> {
             blob_aarch64,
             memory_mib,
             timeout_secs,
+            json,
         ),
     }
 }

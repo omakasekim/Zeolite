@@ -11,12 +11,13 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State as AxumState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -38,6 +39,10 @@ pub struct Gateway {
     pub limits: FaasLimits,
     compiled: Mutex<HashMap<[u8; 32], Arc<Function>>>,
     tenant_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
+    wasm_invocations: AtomicU64,
+    wasm_fuel_used: AtomicU64,
+    vm_boots: AtomicU64,
+    zel_queries: AtomicU64,
 }
 
 impl Gateway {
@@ -55,6 +60,10 @@ impl Gateway {
             limits: FaasLimits::default(),
             compiled: Mutex::new(HashMap::new()),
             tenant_slots: Mutex::new(HashMap::new()),
+            wasm_invocations: AtomicU64::new(0),
+            wasm_fuel_used: AtomicU64::new(0),
+            vm_boots: AtomicU64::new(0),
+            zel_queries: AtomicU64::new(0),
         })
     }
 
@@ -91,14 +100,23 @@ impl Gateway {
 
 pub fn router(gateway: Arc<Gateway>) -> Router {
     Router::new()
+        .route("/metrics", get(metrics))
         .route("/v1/status", get(status))
         .route("/v1/digest", get(digest))
         .route("/v1/leadership/transfer", post(transfer_leadership))
-        .route("/v1/functions/{tenant}/{name}", put(deploy).delete(remove))
+        .route("/v1/functions", get(list_workloads))
+        .route(
+            "/v1/functions/{tenant}/{name}",
+            get(get_workload).put(deploy).delete(remove),
+        )
         .route("/v1/functions/{tenant}/{name}/invoke", post(invoke))
         .route(
             "/v1/functions/{tenant}/{name}/execute/{function}",
             post(execute),
+        )
+        .route(
+            "/v1/functions/{tenant}/{name}/query/{function}",
+            post(query_zel),
         )
         .route("/v1/functions/{tenant}/{name}/boot", post(boot))
         .route("/hooks/{tenant}/{name}", post(webhook))
@@ -210,6 +228,161 @@ async fn digest(AxumState(gateway): AxumState<Arc<Gateway>>) -> Response {
     };
     axum::Json(json!({ "digest": digest, "applied": applied, "workloads": workloads }))
         .into_response()
+}
+
+/// Prometheus text exposition metrics for Raft state, workload inventory, and execution counters.
+async fn metrics(AxumState(gateway): AxumState<Arc<Gateway>>) -> Response {
+    use std::fmt::Write as _;
+    let Some(s) = gateway.node.status().await else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "the node is stopping");
+    };
+    let role_code = match s.role {
+        zeolite_raft::Role::Follower => 0,
+        zeolite_raft::Role::PreCandidate => 1,
+        zeolite_raft::Role::Candidate => 2,
+        zeolite_raft::Role::Leader => 3,
+    };
+    let (zel_count, wasm_count, vm_count) = {
+        let state = gateway.node.state();
+        let state = state.read().unwrap_or_else(|e| e.into_inner());
+        state.counts()
+    };
+    let mut out = String::with_capacity(1024);
+    let _ = writeln!(out, "# HELP zeolite_raft_term Current Raft term.");
+    let _ = writeln!(out, "# TYPE zeolite_raft_term gauge");
+    let _ = writeln!(out, "zeolite_raft_term {}", s.term);
+    let _ = writeln!(
+        out,
+        "# HELP zeolite_raft_role Current Raft role (0=follower, 1=pre_candidate, 2=candidate, 3=leader)."
+    );
+    let _ = writeln!(out, "# TYPE zeolite_raft_role gauge");
+    let _ = writeln!(out, "zeolite_raft_role {role_code}");
+    let _ = writeln!(
+        out,
+        "# HELP zeolite_raft_commit_index Committed Raft log index."
+    );
+    let _ = writeln!(out, "# TYPE zeolite_raft_commit_index gauge");
+    let _ = writeln!(out, "zeolite_raft_commit_index {}", s.commit);
+    let _ = writeln!(
+        out,
+        "# HELP zeolite_raft_applied_index Applied Raft log index."
+    );
+    let _ = writeln!(out, "# TYPE zeolite_raft_applied_index gauge");
+    let _ = writeln!(out, "zeolite_raft_applied_index {}", s.applied);
+    let _ = writeln!(out, "# HELP zeolite_raft_last_index Last Raft log index.");
+    let _ = writeln!(out, "# TYPE zeolite_raft_last_index gauge");
+    let _ = writeln!(out, "zeolite_raft_last_index {}", s.last_index);
+    let _ = writeln!(
+        out,
+        "# HELP zeolite_raft_snapshot_index Last compacted snapshot index."
+    );
+    let _ = writeln!(out, "# TYPE zeolite_raft_snapshot_index gauge");
+    let _ = writeln!(out, "zeolite_raft_snapshot_index {}", s.snapshot_index);
+    let _ = writeln!(
+        out,
+        "# HELP zeolite_workloads_total Deployed workloads by tier."
+    );
+    let _ = writeln!(out, "# TYPE zeolite_workloads_total gauge");
+    let _ = writeln!(out, "zeolite_workloads_total{{kind=\"zel\"}} {zel_count}");
+    let _ = writeln!(out, "zeolite_workloads_total{{kind=\"wasm\"}} {wasm_count}");
+    let _ = writeln!(out, "zeolite_workloads_total{{kind=\"vm\"}} {vm_count}");
+    let _ = writeln!(
+        out,
+        "# HELP zeolite_wasm_invocations_total Total Wasm invocations served by this node."
+    );
+    let _ = writeln!(out, "# TYPE zeolite_wasm_invocations_total counter");
+    let _ = writeln!(
+        out,
+        "zeolite_wasm_invocations_total {}",
+        gateway.wasm_invocations.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP zeolite_wasm_fuel_used_total Cumulative Wasm fuel consumed on this node."
+    );
+    let _ = writeln!(out, "# TYPE zeolite_wasm_fuel_used_total counter");
+    let _ = writeln!(
+        out,
+        "zeolite_wasm_fuel_used_total {}",
+        gateway.wasm_fuel_used.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP zeolite_vm_boots_total Total micro-VM boot requests served by this node."
+    );
+    let _ = writeln!(out, "# TYPE zeolite_vm_boots_total counter");
+    let _ = writeln!(
+        out,
+        "zeolite_vm_boots_total {}",
+        gateway.vm_boots.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP zeolite_zel_queries_total Total read-only Zel queries served by this node."
+    );
+    let _ = writeln!(out, "# TYPE zeolite_zel_queries_total counter");
+    let _ = writeln!(
+        out,
+        "zeolite_zel_queries_total {}",
+        gateway.zel_queries.load(Ordering::Relaxed)
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    (StatusCode::OK, headers, out).into_response()
+}
+
+#[derive(Deserialize)]
+struct ListQuery {
+    tenant: Option<String>,
+}
+
+async fn list_workloads(
+    AxumState(gateway): AxumState<Arc<Gateway>>,
+    Query(query): Query<ListQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = require_admin(&gateway, &headers) {
+        return r;
+    }
+    if let Some(ref tenant) = query.tenant
+        && !valid_name(tenant)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "tenant must be 1-64 characters of [A-Za-z0-9_-]",
+        );
+    }
+    let workloads = {
+        let state = gateway.node.state();
+        let state = state.read().unwrap_or_else(|e| e.into_inner());
+        state.list(query.tenant.as_deref())
+    };
+    axum::Json(json!({ "count": workloads.len(), "workloads": workloads })).into_response()
+}
+
+async fn get_workload(
+    AxumState(gateway): AxumState<Arc<Gateway>>,
+    Path((tenant, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = require_admin(&gateway, &headers) {
+        return r;
+    }
+    if let Err(r) = check_names(&tenant, &name) {
+        return r;
+    }
+    let summary = {
+        let state = gateway.node.state();
+        let state = state.read().unwrap_or_else(|e| e.into_inner());
+        state.summary(&tenant, &name)
+    };
+    match summary {
+        Some(summary) => axum::Json(summary).into_response(),
+        None => error(StatusCode::NOT_FOUND, "no such workload"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -420,6 +593,69 @@ async fn execute(
     }
 }
 
+/// Evaluates a Zel function locally against a snapshot of linear memory without mutating state.
+async fn query_zel(
+    AxumState(gateway): AxumState<Arc<Gateway>>,
+    Path((tenant, name, function)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = require_admin(&gateway, &headers) {
+        return r;
+    }
+    if let Err(r) = check_names(&tenant, &name) {
+        return r;
+    }
+    let parsed: ExecuteBody = if body.is_empty() {
+        ExecuteBody {
+            args: Vec::new(),
+            gas: default_gas(),
+        }
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        }
+    };
+    let slots = gateway.slots(&tenant);
+    let Ok(_permit) = slots.try_acquire_owned() else {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "tenant concurrency limit reached",
+        );
+    };
+    gateway.zel_queries.fetch_add(1, Ordering::Relaxed);
+    let state = gateway.node.state();
+    let result = tokio::task::spawn_blocking(move || {
+        let guard = state.read().unwrap_or_else(|e| e.into_inner());
+        guard.query(&tenant, &name, &function, &parsed.args, parsed.gas)
+    })
+    .await;
+    match result {
+        Ok(Some(Output::Executed { result, gas_used })) => match result {
+            Ok(value) => axum::Json(json!({
+                "result": value,
+                "gas_used": gas_used,
+                "read_only": true,
+            }))
+            .into_response(),
+            Err(trap) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(json!({
+                    "trap": trap,
+                    "gas_used": gas_used,
+                    "read_only": true,
+                })),
+            )
+                .into_response(),
+        },
+        Ok(Some(Output::Rejected(reason))) => error(StatusCode::BAD_REQUEST, reason),
+        Ok(Some(other)) => output_response(other),
+        Ok(None) => error(StatusCode::NOT_FOUND, "no such Zel workload"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 /// A function's module bytes and its webhook secret.
 type WasmEntry = (Arc<Vec<u8>>, Option<Vec<u8>>);
 
@@ -465,6 +701,10 @@ async fn run_wasm(
         Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
+    gateway.wasm_invocations.fetch_add(1, Ordering::Relaxed);
+    gateway
+        .wasm_fuel_used
+        .fetch_add(outcome.fuel_used, Ordering::Relaxed);
 
     let mut headers = HeaderMap::new();
     let mut put_header = |name: &'static str, value: String| {
@@ -596,6 +836,7 @@ async fn boot(
     let mut cfg = VmConfig::new(payload);
     cfg.memory_bytes = query.memory_bytes;
     cfg.timeout = Duration::from_millis(query.timeout_ms.min(60_000));
+    gateway.vm_boots.fetch_add(1, Ordering::Relaxed);
     let result = tokio::task::spawn_blocking(move || zeolite_vmm::run(cfg)).await;
     match result {
         Ok(Ok(outcome)) => axum::Json(json!({

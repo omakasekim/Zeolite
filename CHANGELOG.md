@@ -3,6 +3,27 @@
 Versions follow this rule: a bug or security fix increments `0.0.X`, and new functionality
 or new platform support increments `0.X.0`.
 
+## [0.3.0] - 2026-11-26
+
+Added
+
+- Workload inventory API on the HTTP gateway and state machine: `State::list`, `State::summary`,
+  `State::counts`, `GET /v1/functions[?tenant=...]`, and `GET /v1/functions/{tenant}/{name}`
+  returning per-tier metadata (memory size/SHA-256 for Zel, `has_webhook_secret` without leaking
+  secrets for Wasm, architecture for micro-VMs).
+- Read-only local Zel query execution (`State::query` and
+  `POST /v1/functions/{tenant}/{name}/query/{function}`), evaluating functions against a cloned
+  snapshot of local linear memory without mutating replicated state or incurring a Raft round-trip.
+- Prometheus/OpenMetrics exposition endpoint `GET /metrics` exporting Raft term/role/log/snapshot
+  gauges, deployed workload counts by tier, and node execution counters (`wasm_invocations`,
+  `wasm_fuel_used`, `vm_boots`, `zel_queries`).
+- Machine-readable `--json` output for `zeolite wasm` and `zeolite vm` subcommands.
+
+Changed
+
+- Enabled `main` push and pull request triggers in CI and Repository Guard workflows.
+- Updated workspace dependencies via Dependabot PRs #6 and #7.
+
 ## [0.2.0] - 2026-11-20
 
 Added

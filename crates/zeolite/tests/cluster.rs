@@ -878,6 +878,132 @@ async fn oversized_bodies_are_refused() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inventory_readonly_query_and_prometheus_metrics() {
+    let (s, dir) = single_node_gateway(Some(b"secret-token")).await;
+    let auth = [("Authorization", "Bearer secret-token")];
+
+    assert_eq!(
+        http(
+            s.addr,
+            "PUT",
+            "/v1/functions/acme/counter?kind=zel&memory_bytes=64",
+            &auth,
+            COUNTER.as_bytes(),
+        )
+        .await
+        .status,
+        200
+    );
+    assert_eq!(
+        http(
+            s.addr,
+            "PUT",
+            "/v1/functions/beta/guest?kind=vm&arch=aarch64",
+            &auth,
+            &[0xD4, 0x00, 0x00, 0x02],
+        )
+        .await
+        .status,
+        200
+    );
+
+    // Mutate once via Raft consensus.
+    let exec_resp = http(
+        s.addr,
+        "POST",
+        "/v1/functions/acme/counter/execute/add",
+        &auth,
+        br#"{"args":[10]}"#,
+    )
+    .await;
+    assert_eq!(exec_resp.status, 200);
+    let digest_before: serde_json::Value =
+        serde_json::from_slice(&http(s.addr, "GET", "/v1/digest", &[], b"").await.body).unwrap();
+
+    // Read-only query calls `add(5)` locally, seeing 15 without mutating replicated memory.
+    let query_resp = http(
+        s.addr,
+        "POST",
+        "/v1/functions/acme/counter/query/add",
+        &auth,
+        br#"{"args":[5]}"#,
+    )
+    .await;
+    assert_eq!(query_resp.status, 200);
+    let q: serde_json::Value = serde_json::from_slice(&query_resp.body).unwrap();
+    assert_eq!(q["result"], 15);
+    assert_eq!(q["read_only"], true);
+
+    let digest_after: serde_json::Value =
+        serde_json::from_slice(&http(s.addr, "GET", "/v1/digest", &[], b"").await.body).unwrap();
+    assert_eq!(digest_before["digest"], digest_after["digest"]);
+
+    // Confirm stored counter is still 10 via read-only `get`.
+    let get_resp = http(
+        s.addr,
+        "POST",
+        "/v1/functions/acme/counter/query/get",
+        &auth,
+        b"",
+    )
+    .await;
+    let g: serde_json::Value = serde_json::from_slice(&get_resp.body).unwrap();
+    assert_eq!(g["result"], 10);
+
+    // Workload inventory endpoints respect auth and tenant filtering.
+    assert_eq!(
+        http(s.addr, "GET", "/v1/functions", &[], b"").await.status,
+        401
+    );
+    let list_all: serde_json::Value =
+        serde_json::from_slice(&http(s.addr, "GET", "/v1/functions", &auth, b"").await.body)
+            .unwrap();
+    assert_eq!(list_all["count"], 2);
+    let list_acme: serde_json::Value = serde_json::from_slice(
+        &http(s.addr, "GET", "/v1/functions?tenant=acme", &auth, b"")
+            .await
+            .body,
+    )
+    .unwrap();
+    assert_eq!(list_acme["count"], 1);
+    assert_eq!(list_acme["workloads"][0]["kind"], "zel");
+    assert_eq!(list_acme["workloads"][0]["memory_bytes"], 64);
+
+    let detail: serde_json::Value = serde_json::from_slice(
+        &http(s.addr, "GET", "/v1/functions/beta/guest", &auth, b"")
+            .await
+            .body,
+    )
+    .unwrap();
+    assert_eq!(detail["kind"], "vm");
+    assert_eq!(detail["arch"], "aarch64");
+    assert_eq!(
+        http(s.addr, "GET", "/v1/functions/beta/missing", &auth, b"")
+            .await
+            .status,
+        404
+    );
+
+    // Prometheus /metrics exposition includes Raft gauges, tier counts, and query counter.
+    let m = http(s.addr, "GET", "/metrics", &[], b"").await;
+    assert_eq!(m.status, 200);
+    let text = String::from_utf8_lossy(&m.body);
+    assert!(text.contains("zeolite_raft_role 3\n"), "{text}");
+    assert!(
+        text.contains("zeolite_workloads_total{kind=\"zel\"} 1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("zeolite_workloads_total{kind=\"vm\"} 1\n"),
+        "{text}"
+    );
+    assert!(text.contains("zeolite_zel_queries_total 2\n"), "{text}");
+
+    s.server.abort();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn vm_image_commands_round_trip_through_the_log_encoding() {
     let command = Command::DeployVm {

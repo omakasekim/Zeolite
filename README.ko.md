@@ -42,6 +42,13 @@ Apple Silicon 디버그 빌드 기준:
 
 버그 수정 및 보안 패치는 `0.0.X`, 신규 기능 및 플랫폼 지원 추가는 `0.X.0`을 증가시킵니다. 세부 사항은 [CHANGELOG.md](CHANGELOG.md)를 참조하십시오.
 
+## 0.3.0 변경 사항
+
+- **워크로드 목록/조회 API**: `GET /v1/functions[?tenant=...]` 및 `GET /v1/functions/{tenant}/{name}`으로 배포된 Zel/Wasm/VM 워크로드 메타데이터와 Zel 선형 메모리 SHA-256 다이제스트를 안전하게(시크릿 비노출) 조회할 수 있습니다.
+- **읽기 전용 로컬 Zel 쿼리**: `POST /v1/functions/{tenant}/{name}/query/{function}`는 복제 상태를 변경하거나 Raft 합의를 거치지 않고 로컬 메모리 스냅샷 복제본에서 Zel 함수를 결정론적으로 평가합니다.
+- **Prometheus 메트릭 엔드포인트**: `GET /metrics`가 Raft 텀/역할/로그/스냅샷 게이지, 계층별 워크로드 수, Wasm/VM/Zel 실행 카운터를 OpenMetrics/Prometheus 텍스트 형식으로 노출합니다.
+- **CLI JSON 출력 확장**: `zeolite wasm --json`, `zeolite vm --json`을 추가해 모든 로컬 CLI 명령이 기계 판독 가능한 JSON 출력을 지원합니다.
+
 ## 0.2.0 변경 사항
 
 - **리더십 이전**: `POST /v1/leadership/transfer`에 `{"to": 2}`를 보내면 리더가 쓰기를 멈추고 대상 노드의 로그를 최신으로 맞춘 뒤, 새 `TimeoutNow` 메시지로 즉시 선거를 시작하게 합니다. 대상이 리더가 되면 응답이 돌아오며 보통 한 텀이 증가합니다. 선거 타임아웃 안에 끝나지 않으면 이전은 취소되고 기존 리더가 계속 쓰기를 받습니다. 모든 노드가 0.2.0 이상이어야 합니다.

@@ -122,12 +122,16 @@ curl 127.0.0.1:8002/v1/digest
 
 | Method and path | Purpose | Auth |
 | --- | --- | --- |
+| `GET /metrics` | Prometheus metrics (Raft gauges, tier counts, execution counters) | None |
 | `GET /v1/status` | Role, term, leader and log positions | None |
 | `GET /v1/digest` | SHA-256 of the replicated state | None |
 | `POST /v1/leadership/transfer` | Hand leadership to another node | Token |
+| `GET /v1/functions[?tenant=...]` | List deployed workloads (redacting secrets) | Token |
+| `GET /v1/functions/{tenant}/{name}` | Inspect one workload's metadata and memory digest | Token |
 | `PUT /v1/functions/{tenant}/{name}?kind=zel\|wasm\|vm` | Deploy a workload | Token |
 | `DELETE /v1/functions/{tenant}/{name}` | Remove a workload | Token |
 | `POST /v1/functions/{tenant}/{name}/execute/{function}` | Run Zel on all replicas | Token |
+| `POST /v1/functions/{tenant}/{name}/query/{function}` | Read-only local Zel query (no state mutation) | Token |
 | `POST /v1/functions/{tenant}/{name}/invoke` | Run Wasm on this node | Token |
 | `POST /v1/functions/{tenant}/{name}/boot` | Boot a micro-VM on this node | Token |
 | `POST /hooks/{tenant}/{name}` | Webhook trigger for a Wasm function | HMAC if a secret is set |

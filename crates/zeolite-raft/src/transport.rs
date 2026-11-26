@@ -67,7 +67,7 @@ struct Cipher {
 impl Cipher {
     fn new(key: [u8; 32]) -> Self {
         Cipher {
-            aead: ChaCha20Poly1305::new(Key::from_slice(&key)),
+            aead: ChaCha20Poly1305::new(&Key::from(key)),
             counter: 0,
         }
     }
@@ -82,14 +82,14 @@ impl Cipher {
     fn seal(&mut self, plain: &[u8]) -> io::Result<Vec<u8>> {
         let n = self.nonce();
         self.aead
-            .encrypt(Nonce::from_slice(&n), plain)
+            .encrypt(&Nonce::from(n), plain)
             .map_err(|_| io::Error::other("frame encryption failed"))
     }
 
     fn open(&mut self, sealed: &[u8]) -> io::Result<Vec<u8>> {
         let n = self.nonce();
         self.aead
-            .decrypt(Nonce::from_slice(&n), sealed)
+            .decrypt(&Nonce::from(n), sealed)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame failed authentication"))
     }
 }

@@ -1916,7 +1916,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "zeolite"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "clap",
@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "zeolite-faas"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "wasmtime",
  "wat",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "zeolite-jit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1955,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "zeolite-raft"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chacha20poly1305",
  "crc32fast",
@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "zeolite-vmm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "getrandom",
  "libc",
